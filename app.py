@@ -1,77 +1,262 @@
-from ultralytics import YOLO
-import gradio as gr
+import torch
 import cv2
 import numpy as np
+from PIL import Image
+from torchvision import transforms
+from ultralytics import YOLO
+from models.osnet import osnet_x1_0
+import os
+from scipy.optimize import linear_sum_assignment
 
-model = YOLO(r"E:\lenovo\Documents\工程实践\YOLO_ReID_Project\runs\detect\train-3\weights\best.pt")
+# ===================== 全局配置 =====================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+YOLO_WEIGHT_PATH = r"E:\lenovo\Documents\工程实践\reid_project\yolov8_weights\yolov8n.pt"
+REID_WEIGHT = "./runs/osnet_epoch20.pth"
+IMG_SIZE = (128, 256)
 
-def detect_with_reid(img, conf=0.25):
-    img_np = np.array(img)
-    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+# 【关键参数】平衡ID稳定性和误检过滤
+YOLO_CONF_THRESHOLD = 0.7
+SIM_THRESHOLD = 0.65
+IOU_THRESHOLD = 0.3
+MAX_MISS_FRAMES = 8        # 缩短目标存活时间，避免长时间残留
+MIN_BOX_RATIO = 1.3
+MIN_BOX_SIZE = 35
 
-    results = model.predict(img_cv, conf=conf, iou=0.45, classes=[0], verbose=False)
-    result = results[0]
+# 自动创建文件夹
+os.makedirs("./static", exist_ok=True)
 
-    person_id = 1
-    person_cnt = 0
+# ===================== 加载模型 =====================
+if not os.path.exists(YOLO_WEIGHT_PATH):
+    raise FileNotFoundError(f"模型不存在，请检查：{YOLO_WEIGHT_PATH}")
+yolo_model = YOLO(YOLO_WEIGHT_PATH)
+print("✅ YOLO 模型加载完成")
 
-    for box in result.boxes:
-        cls_id = int(box.cls[0])
-        cls_name = model.names[cls_id]
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
+reid_model = osnet_x1_0(num_classes=751).to(DEVICE)
+reid_model.load_state_dict(torch.load(REID_WEIGHT, map_location=DEVICE))
+reid_model.eval()
+print("✅ ReID 模型加载完成")
 
-        if cls_name == "person":
-            label = f"person:{person_id}"
-            color = (0, 0, 255)  
-            person_id += 1
-            person_cnt += 1
+# 图像预处理
+transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
-            cv2.rectangle(img_cv, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(img_cv, label, (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+# ===================== 重识别 & 统计全局变量 =====================
+class TrackedPerson:
+    def __init__(self, feat, bbox):
+        self.id = -1
+        self.feat_history = [feat]
+        self.bbox = bbox
+        self.miss_frames = 0
 
-    info = f"检测到人物总数：{person_cnt}"
+    def update(self, new_feat, new_bbox):
+        self.feat_history.append(new_feat)
+        if len(self.feat_history) > 5:
+            self.feat_history.pop(0)
+        self.bbox = new_bbox
+        self.miss_frames = 0
 
-    img_final = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    return img_final, info
+    def avg_feature(self):
+        return np.mean(self.feat_history, axis=0)
 
-with gr.Blocks(
-    title="YOLO 人物检测",
-    theme=gr.themes.Soft(),
-    css="""
-    #title {text-align: center; font-size: 2em; font-weight: bold; margin-bottom: 1rem;}
-    .gradio-container {padding: 1.5rem; max-width: 1200px; margin: 0 auto;}
-    """
-) as demo:
-    gr.Markdown("# 🎯 YOLO 人物检测系统", elem_id="title")
-    gr.Markdown("---")
+tracked_persons = []
+next_id = 0
+frame_person_count = []
+total_person_num = 0
+max_frame_count = 0
 
-    with gr.Row():
-        with gr.Column():
-            gr.Markdown("### 📤 上传图片")
-            in_img = gr.Image(type="pil", label="")
+def reset_all_stats():
+    global tracked_persons, next_id, frame_person_count, total_person_num, max_frame_count
+    tracked_persons = []
+    next_id = 0
+    frame_person_count = []
+    total_person_num = 0
+    max_frame_count = 0
 
-        with gr.Column():
-            gr.Markdown("### 📷 检测结果（带ID）")
-            out_img = gr.Image(type="numpy", label="")
+def iou(bbox1, bbox2):
+    x1, y1, x2, y2 = bbox1
+    x1_, y1_, x2_, y2_ = bbox2
+    xx1 = max(x1, x1_)
+    yy1 = max(y1, y1_)
+    xx2 = min(x2, x2_)
+    yy2 = min(y2, y2_)
+    w = max(0, xx2 - xx1)
+    h = max(0, yy2 - yy1)
+    inter = w * h
+    area1 = (x2-x1)*(y2-y1)
+    area2 = (x2_-x1_)*(y2_-y1_)
+    return inter / (area1 + area2 - inter) if (area1 + area2 - inter) != 0 else 0
 
-    gr.Markdown("---")
-    with gr.Row():
-        with gr.Column(scale=3):
-            conf_slider = gr.Slider(
-                minimum=0.1, maximum=1.0, value=0.25, step=0.05,
-                label="置信度阈值", info="推荐默认值 0.25，可根据效果微调"
-            )
-            info_text = gr.Textbox(label="📊 统计结果", interactive=False)
+def filter_detections(bbox, conf, img_h, img_w):
+    x1, y1, x2, y2 = bbox
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+    if conf < YOLO_CONF_THRESHOLD:
+        return False
+    if h / w < MIN_BOX_RATIO:
+        return False
+    if h < MIN_BOX_SIZE or w < MIN_BOX_SIZE:
+        return False
+    if x1 < 0 or y1 < 0 or x2 > img_w or y2 > img_h:
+        return False
+    return True
 
-        with gr.Column(scale=1):
-            btn = gr.Button("开始检测", variant="primary", size="lg")
+def extract_feature(crop_img):
+    img = Image.fromarray(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
+    img = transform(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        _, feat = reid_model(img)
+    return feat.cpu().numpy()[0]
 
-    btn.click(
-        detect_with_reid,
-        inputs=[in_img, conf_slider],
-        outputs=[out_img, info_text]
-    )
+def match_persons(detections):
+    global tracked_persons, next_id
+    if not tracked_persons:
+        for det in detections:
+            new_person = TrackedPerson(det['feat'], det['bbox'])
+            new_person.id = next_id
+            next_id += 1
+            tracked_persons.append(new_person)
+        return tracked_persons
 
-if __name__ == "__main__":
-    demo.launch(server_port=7860)
+    n_tracked = len(tracked_persons)
+    n_detections = len(detections)
+    cost_matrix = np.zeros((n_tracked, n_detections))
+
+    # 特征相似度为主，IOU为辅
+    for i, t in enumerate(tracked_persons):
+        for j, d in enumerate(detections):
+            sim = np.dot(t.avg_feature(), d['feat']) / (np.linalg.norm(t.avg_feature()) * np.linalg.norm(d['feat']))
+            iou_score = iou(t.bbox, d['bbox'])
+            cost_matrix[i, j] = -(sim * 0.8 + iou_score * 0.2)
+
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    matched_detections = set()
+    matched_trackers = set()
+
+    # 更新匹配上的目标
+    for i, j in zip(row_ind, col_ind):
+        if -cost_matrix[i, j] > SIM_THRESHOLD:
+            tracked_persons[i].update(detections[j]['feat'], detections[j]['bbox'])
+            matched_detections.add(j)
+            matched_trackers.add(i)
+        else:
+            tracked_persons[i].miss_frames += 1
+
+    # 给未匹配的跟踪器增加miss计数
+    for i in range(n_tracked):
+        if i not in matched_trackers:
+            tracked_persons[i].miss_frames += 1
+
+    # 处理未匹配的检测结果，作为新目标
+    for j, det in enumerate(detections):
+        if j not in matched_detections:
+            new_person = TrackedPerson(det['feat'], det['bbox'])
+            new_person.id = next_id
+            next_id += 1
+            tracked_persons.append(new_person)
+
+    # 【核心改动】只保留在当前帧匹配上的目标，或刚匹配上的目标
+    tracked_persons = [p for p in tracked_persons if p.miss_frames < MAX_MISS_FRAMES]
+    return tracked_persons
+
+def process_frame(frame):
+    global max_frame_count, total_person_num
+    img_h, img_w = frame.shape[:2]
+    results = yolo_model(frame, classes=0, conf=YOLO_CONF_THRESHOLD)
+    detections = []
+
+    for res in results:
+        boxes = res.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            conf = float(box.conf[0])
+            if not filter_detections((x1, y1, x2, y2), conf, img_h, img_w):
+                continue
+            crop = frame[y1:y2, x1:x2]
+            if crop.shape[0] < 30 or crop.shape[1] < 30:
+                continue
+            feat = extract_feature(crop)
+            detections.append({
+                'bbox': (x1, y1, x2, y2),
+                'feat': feat
+            })
+
+    matched_persons = match_persons(detections)
+    current_frame_person = len(matched_persons)
+    frame_person_count.append(current_frame_person)
+    if current_frame_person > max_frame_count:
+        max_frame_count = current_frame_person
+
+    total_person_num = next_id
+
+    # 【核心改动】只绘制当前帧匹配上的目标，不再绘制已消失的目标
+    for p in matched_persons:
+        if p.miss_frames == 0:  # 只有当前帧匹配上的目标才绘制
+            x1, y1, x2, y2 = p.bbox
+            color = ((p.id * 73) % 256, (p.id * 137) % 256, (p.id * 193) % 256)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"ID:{p.id}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return frame
+
+def calc_statistics():
+    if not frame_person_count:
+        return {
+            "total_person": 0,
+            "max_frame": 0,
+            "avg_frame": 0.0,
+            "frame_data": []
+        }
+    avg = round(sum(frame_person_count) / len(frame_person_count), 2)
+    return {
+        "total_person": total_person_num,
+        "max_frame": max_frame_count,
+        "avg_frame": avg,
+        "frame_data": frame_person_count
+    }
+
+def predict_image(img_path, save_path="./static/result.jpg"):
+    reset_all_stats()
+    img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError("读取图片失败")
+    processed_img = process_frame(img)
+    cv2.imwrite(save_path, processed_img)
+    stat = calc_statistics()
+    return save_path, stat
+
+def predict_video(video_path, save_path="./static/result.mp4", fps=None):
+    reset_all_stats()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("读取视频失败")
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video_fps = fps if fps else cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(save_path, fourcc, video_fps, (w, h))
+
+    frame_idx = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = process_frame(frame)
+        out.write(frame)
+        frame_idx += 1
+        if frame_idx % 100 == 0:
+            print(f"已处理 {frame_idx}/{total_frames} 帧")
+
+    cap.release()
+    out.release()
+    print("✅ 视频处理完成")
+    stat = calc_statistics()
+    return save_path, stat
