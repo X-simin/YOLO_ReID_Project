@@ -14,13 +14,13 @@ YOLO_WEIGHT_PATH = r"E:\lenovo\Documents\工程实践\reid_project\yolov8_weight
 REID_WEIGHT = "./runs/osnet_epoch20.pth"
 IMG_SIZE = (128, 256)
 
-# 【关键参数】平衡ID稳定性和误检过滤
-YOLO_CONF_THRESHOLD = 0.7
-SIM_THRESHOLD = 0.65
+# 关键参数
+YOLO_CONF_THRESHOLD = 0.65  
+SIM_THRESHOLD = 0.7         
 IOU_THRESHOLD = 0.3
-MAX_MISS_FRAMES = 8        # 缩短目标存活时间，避免长时间残留
-MIN_BOX_RATIO = 1.3
-MIN_BOX_SIZE = 35
+MAX_MISS_FRAMES = 10       
+MIN_BOX_RATIO = 1.2         
+MIN_BOX_SIZE = 30          
 
 # 自动创建文件夹
 os.makedirs("./static", exist_ok=True)
@@ -126,7 +126,6 @@ def match_persons(detections):
     n_detections = len(detections)
     cost_matrix = np.zeros((n_tracked, n_detections))
 
-    # 特征相似度为主，IOU为辅
     for i, t in enumerate(tracked_persons):
         for j, d in enumerate(detections):
             sim = np.dot(t.avg_feature(), d['feat']) / (np.linalg.norm(t.avg_feature()) * np.linalg.norm(d['feat']))
@@ -136,23 +135,19 @@ def match_persons(detections):
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
     matched_detections = set()
-    matched_trackers = set()
-
-    # 更新匹配上的目标
     for i, j in zip(row_ind, col_ind):
         if -cost_matrix[i, j] > SIM_THRESHOLD:
             tracked_persons[i].update(detections[j]['feat'], detections[j]['bbox'])
             matched_detections.add(j)
-            matched_trackers.add(i)
         else:
             tracked_persons[i].miss_frames += 1
 
-    # 给未匹配的跟踪器增加miss计数
-    for i in range(n_tracked):
-        if i not in matched_trackers:
-            tracked_persons[i].miss_frames += 1
+    # 未匹配的跟踪器计数
+    for t in tracked_persons:
+        if t.miss_frames > 0:
+            t.miss_frames += 1
 
-    # 处理未匹配的检测结果，作为新目标
+    # 未匹配的检测目标
     for j, det in enumerate(detections):
         if j not in matched_detections:
             new_person = TrackedPerson(det['feat'], det['bbox'])
@@ -160,7 +155,7 @@ def match_persons(detections):
             next_id += 1
             tracked_persons.append(new_person)
 
-    # 【核心改动】只保留在当前帧匹配上的目标，或刚匹配上的目标
+    # 移除长时间未匹配的目标
     tracked_persons = [p for p in tracked_persons if p.miss_frames < MAX_MISS_FRAMES]
     return tracked_persons
 
@@ -194,9 +189,8 @@ def process_frame(frame):
 
     total_person_num = next_id
 
-    # 【核心改动】只绘制当前帧匹配上的目标，不再绘制已消失的目标
     for p in matched_persons:
-        if p.miss_frames == 0:  # 只有当前帧匹配上的目标才绘制
+        if p.miss_frames == 0:
             x1, y1, x2, y2 = p.bbox
             color = ((p.id * 73) % 256, (p.id * 137) % 256, (p.id * 193) % 256)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
