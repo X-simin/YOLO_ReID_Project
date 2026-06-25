@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>行人检测与跨帧重识别系统</title>
+    <!-- 引入Chart.js图表库 -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: "Microsoft Yahei", sans-serif;
+        }
+        body {
+            background-color: #f3eefc; 
+            padding: 30px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            color: #6c4f9c;
+            margin-bottom: 30px;
+        }
+        /* 通用卡片样式 */
+        .card {
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 25px;
+            box-shadow: 0 2px 10px #d8c8f0;
+        }
+        .card h2 {
+            color: #7b5cb8;
+            margin-bottom: 15px;
+            border-left: 5px solid #9c7cd8;
+            padding-left: 10px;
+        }
+        /* 上传表单 */
+        form {
+            margin: 10px 0;
+        }
+        input[type="file"] {
+            padding: 8px;
+            margin-right: 15px;
+        }
+        button {
+            background-color: #8c6cd2;
+            color: #fff;
+            border: none;
+            padding: 9px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 15px;
+        }
+        button:hover {
+            background-color: #7253b8;
+        }
+        /* 统计数据面板 */
+        .stat-row {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin: 15px 0;
+        }
+        .stat-item {
+            background: #ede4f8;
+            padding: 15px 25px;
+            border-radius: 8px;
+            min-width: 180px;
+            text-align: center;
+        }
+        .stat-item p {
+            font-size: 14px;
+            color: #555;
+        }
+        .stat-item span {
+            font-size: 24px;
+            font-weight: bold;
+            color: #6c4f9c;
+        }
+        /* 图表区域 */
+        .chart-box {
+            display: flex;
+            gap: 30px;
+            flex-wrap: wrap;
+            margin-top: 20px;
+        }
+        .chart-item {
+            flex: 1;
+            min-width: 450px;
+        }
+        /* 结果图片 */
+        .result-img {
+            margin-top: 20px;
+        }
+        .result-img img {
+            max-width: 100%;
+            border: 2px solid #d8c8f0;
+            border-radius: 8px;
+        }
+        .download-btn {
+            margin-top: 15px;
+            background-color: #6c4f9c;
+        }
+        .download-btn:hover {
+            background-color: #5a3f8a;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>行人检测与跨帧重识别系统</h1>
+
+        <!-- 图片上传板块 -->
+        <div class="card">
+            <h2>图片检测与重识别</h2>
+            <form action="/upload" method="post" enctype="multipart/form-data">
+                <input type="file" name="imgfile" accept="image/*" required>
+                <button type="submit">上传并分析</button>
+            </form>
+
+            <!-- 展示处理后图片 -->
+            {% if res_img %}
+            <div class="result-img">
+                <h3 style="color:#6c4f9c;margin:15px 0;">检测结果（框内为行人ID）</h3>
+                <img src="{{ res_img }}">
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- 视频上传板块 -->
+        <div class="card">
+            <h2>视频检测与重识别</h2>
+            <form action="/upload_video" method="post" enctype="multipart/form-data">
+                <input type="file" name="vidfile" accept="video/*" required>
+                <button type="submit">上传并分析（处理完成后显示下载按钮）</button>
+            </form>
+            <p style="color:#888;margin-top:10px;">提示：视频处理耗时较长，请耐心等待，控制台可查看进度</p>
+            {% if video_ready %}
+            <a href="{{ url_for('download_video') }}">
+                <button class="download-btn">点击下载处理后的视频</button>
+            </a>
+            {% endif %}
+        </div>
+
+        <!-- 数据统计板块 -->
+        {% if stat %}
+        <div class="card">
+            <h2>行人数据统计分析</h2>
+            <div class="stat-row">
+                <div class="stat-item">
+                    <p>总独立行人数</p>
+                    <span>{{ stat.total_person }}</span>
+                </div>
+                <div class="stat-item">
+                    <p>单帧最大人数</p>
+                    <span>{{ stat.max_frame }}</span>
+                </div>
+                <div class="stat-item">
+                    <p>平均每帧人数</p>
+                    <span>{{ stat.avg_frame }}</span>
+                </div>
+            </div>
+
+            <!-- 图表区域：柱状图 + 饼图 -->
+            <div class="chart-box">
+                <div class="chart-item">
+                    <canvas id="barChart"></canvas>
+                </div>
+                <div class="chart-item">
+                    <canvas id="pieChart"></canvas>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- 图表渲染脚本 -->
+    {% if stat %}
+    <script>
+        // 每帧人数数据
+        const frameData = {{ stat.frame_data|tojson }};
+        const totalPeople = {{ stat.total_person }};
+        const maxPeople = {{ stat.max_frame }};
+
+        // 1. 柱状图：每帧行人数量变化
+        const barCtx = document.getElementById('barChart').getContext('2d');
+        new Chart(barCtx, {
+            type: 'bar',
+            data: {
+                labels: frameData.map((_, idx) => `第${idx+1}帧`),
+                datasets: [{
+                    label: '单帧行人数量',
+                    data: frameData,
+                    backgroundColor: '#a88ee8',
+                    borderRadius: 4
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: '逐帧行人数量统计',
+                        font: {size:16},
+                        color: '#6c4f9c'
+                    }
+                },
+                scales: {
+                    y: { beginAtZero: true }
+                }
+            }
+        });
+
+        // 2. 饼图：整体人员分布（总人数 / 空帧占比）
+        const allFrame = frameData.length;
+        const emptyFrame = frameData.filter(x => x === 0).length;
+        const haveFrame = allFrame - emptyFrame;
+
+        const pieCtx = document.getElementById('pieChart').getContext('2d');
+        new Chart(pieCtx, {
+            type: 'pie',
+            data: {
+                labels: ['有人帧', '空帧'],
+                datasets: [{
+                    data: [haveFrame, emptyFrame],
+                    backgroundColor: ['#8c6cd2', '#d8c8f0']
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: '画面帧状态占比',
+                        font: {size:16},
+                        color: '#6c4f9c'
+                    }
+                }
+            }
+        });
+    </script>
+    {% endif %}
+</body>
+</html>
